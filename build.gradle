@@ -35,6 +35,8 @@ repositories {
 dependencies {
   providedCompile 'org.apache.tomcat:tomcat-catalina:8.0.45'
   compile project(':nshmp-haz')
+  compile ('com.amazonaws:aws-lambda-java-core:1.1.0',
+      'com.amazonaws:aws-java-sdk-lambda:1.11.461')
 }
 
 sourceSets {
@@ -102,4 +104,12 @@ war {
 task assembleUsgs(type: Sync) {
     into "${libsDir}/exploded-war"
     with war
+}
+
+jar {
+  from {
+    configurations.compile.collect {
+      it.isDirectory() ? it : zipTree(it)
+    }
+  }
 }

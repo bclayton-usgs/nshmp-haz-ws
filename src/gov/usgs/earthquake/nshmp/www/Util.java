@@ -3,12 +3,23 @@ package gov.usgs.earthquake.nshmp.www;
 import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.base.Preconditions.checkState;
 
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
+import java.io.UnsupportedEncodingException;
 import java.util.Arrays;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
 import javax.servlet.ServletRequest;
+
+import com.amazonaws.services.lambda.runtime.Context;
+import com.amazonaws.services.lambda.runtime.LambdaLogger;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 
 import gov.usgs.earthquake.nshmp.internal.Parsing;
 import gov.usgs.earthquake.nshmp.internal.Parsing.Delimiter;
@@ -90,6 +101,29 @@ public class Util {
         .collect(Collectors.toSet());
   }
 
+  /**
+   * Parse the Lambda function {@code InputStream} into an {@code JsonObject}.
+   */
+  static class LambdaHelper {
+
+    JsonObject requestJson;
+    OutputStreamWriter writer;
+    Context context;
+    LambdaLogger logger;
+
+    LambdaHelper(InputStream input, OutputStream output, Context context)
+        throws UnsupportedEncodingException {
+
+      BufferedReader reader = new BufferedReader(new InputStreamReader(input));
+      JsonParser parser = new JsonParser();
+
+      requestJson = parser.parse(reader).getAsJsonObject();
+      writer = new OutputStreamWriter(output, "UTF-8");
+      logger = context.getLogger();
+      this.context = context;
+    }
+  }
+
   enum Key {
     EDITION,
     REGION,
@@ -113,6 +147,28 @@ public class Util {
     public String toString() {
       return label;
     }
+  }
+
+  /**
+   * Common request keys
+   */
+  static class RequestKey {
+    static final String BODY = "body";
+    static final String QUERY_STRING_PARAMETERS = "queryStringParameters";
+    static final String SERVICE = "service";
+    static final String MULTI_QUERY_STRING_PARAMETERS = "multiValueQueryStringParameters";
+    static final String HTTP_EVENT = "httpMethod";
+    static final String HTTP_GET = "GET";
+    static final String HTTP_POST = "POST";
+  }
+
+  /**
+   * Common response keys
+   */
+  static class ResponseKey {
+    static final String STATUS_CODE = "statusCode";
+    static final String STATUS_CODE_OK = "200";
+    static final String STATUS_CODE_ERROR = "400";
   }
 
   static <T extends Enum<T>> Set<T> readValues(String values, Class<T> type) {

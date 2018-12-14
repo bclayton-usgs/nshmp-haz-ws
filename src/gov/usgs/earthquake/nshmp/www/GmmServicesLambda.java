@@ -6,9 +6,12 @@ import static gov.usgs.earthquake.nshmp.gmm.GmmInput.Field.VSINF;
 import static gov.usgs.earthquake.nshmp.gmm.Imt.AI;
 import static gov.usgs.earthquake.nshmp.gmm.Imt.PGV;
 import static gov.usgs.earthquake.nshmp.www.Util.RequestKey.BODY;
+import static gov.usgs.earthquake.nshmp.www.Util.RequestKey.EVENT;
 import static gov.usgs.earthquake.nshmp.www.Util.RequestKey.HTTP_EVENT;
 import static gov.usgs.earthquake.nshmp.www.Util.RequestKey.HTTP_GET;
 import static gov.usgs.earthquake.nshmp.www.Util.RequestKey.HTTP_POST;
+import static gov.usgs.earthquake.nshmp.www.Util.RequestKey.INVOKE;
+import static gov.usgs.earthquake.nshmp.www.Util.RequestKey.INVOKE_BATCH;
 import static gov.usgs.earthquake.nshmp.www.Util.RequestKey.MULTI_QUERY_STRING_PARAMETERS;
 import static gov.usgs.earthquake.nshmp.www.Util.RequestKey.QUERY_STRING_PARAMETERS;
 import static gov.usgs.earthquake.nshmp.www.Util.RequestKey.SERVICE;
@@ -39,6 +42,7 @@ import com.google.common.base.Enums;
 import com.google.common.base.Splitter;
 import com.google.common.base.Throwables;
 import com.google.common.collect.FluentIterable;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Range;
 import com.google.common.collect.Sets;
 import com.google.common.primitives.Doubles;
@@ -77,7 +81,15 @@ public class GmmServicesLambda implements RequestStreamHandler {
   private static final String RMAX_KEY = "rMax";
   private static final String IMT_KEY = "imt";
   private static final int ROUND = 5;
+  
+  private static final double GMM_DISTANCE_RMIN_DEFAULT = 0.1;
+  private static final double GMM_DISTANCE_RMAX_DEFAULT = 300.0;
+  
+  private static final double HW_FW_RMIN_DEFAULT = -20.0;
+  private static final double HW_FW_RMAX_DEFAULT = 70.0;
 
+  private static final Imt IMT_DEFAULT = Imt.PGA;
+  
   static {
     GSON = new GsonBuilder()
         .setPrettyPrinting()
@@ -86,6 +98,7 @@ public class GmmServicesLambda implements RequestStreamHandler {
         .registerTypeAdapter(Double.class, new Util.NaNSerializer())
         .registerTypeAdapter(Parameters.class, new Parameters.Serializer())
         .registerTypeAdapter(Imt.class, new Util.EnumSerializer<Imt>())
+        .registerTypeAdapter(Service.class, new ServiceSerializer())
         .create();
   }
 
@@ -96,28 +109,61 @@ public class GmmServicesLambda implements RequestStreamHandler {
   @Override
   public void handleRequest(InputStream input, OutputStream output, Context context) throws IOException {
     LambdaHelper lambdaHelper = new LambdaHelper(input, output, context);
-
+    
     try {
       lambdaHelper.logger.log("\n Request: \n" + GSON.toJson(lambdaHelper.requestJson) + "\n");
 
+      Response response;
       JsonObject parameters;
       JsonObject requestJson = lambdaHelper.requestJson;
+
+      if (requestJson.has(HTTP_EVENT)) {
+        if (!hasQueryParameters(lambdaHelper)) return;
+        
+        parameters = parseHttpEvent(lambdaHelper);
+
+        if (!hasGMM(parameters, lambdaHelper)) return;
+        
+        String httpEvent = requestJson.get(HTTP_EVENT).getAsString();
       
-      if (requestJson.has(HTTP_EVENT) && HTTP_GET.equals(requestJson.get(HTTP_EVENT).getAsString())) {
-        parameters = parseHttpGetEvent(lambdaHelper);
-        handleGetEvent(parameters, lambdaHelper);
-      } else if (requestJson.has(HTTP_EVENT) && HTTP_POST.equals(requestJson.get(HTTP_EVENT).getAsString())) {
-       parameters = parseHttpPostEvent(lambdaHelper); 
-       handlePostEvent(parameters, lambdaHelper);
-      } else  {
-        throw new RuntimeException("Event not supported");
+        switch (httpEvent) {
+          case HTTP_GET:
+            response = handleEvent(parameters);
+            break;
+          case HTTP_POST:
+            response = handleBatchEvent(parameters);
+            break;
+          default:
+            throw new IllegalStateException("HTTP event [" + httpEvent +"] not supported");
+        }
+      } else if (requestJson.has(EVENT)) {
+        parameters = requestJson;
+        
+        if (!hasGMM(parameters, lambdaHelper)) return;
+       
+        String eventType = requestJson.get(EVENT).getAsString();
+        
+        switch (eventType) {
+          case INVOKE:
+            response = handleEvent(parameters);
+            break;
+          case INVOKE_BATCH:
+            response = handleBatchEvent(parameters);
+            break;
+          default:
+            throw new IllegalStateException("Event [" + eventType +"] not supported");
+        }
+      } else {
+        throw new IllegalStateException("Event not supported");
       }
-      
+
+      writeResponse(response, lambdaHelper);
     } catch (Exception e) {
       JsonObject responseJson = new JsonObject();
       String message = errorMessage("", e, false);
       responseJson.addProperty(STATUS_CODE, STATUS_CODE_ERROR);
       responseJson.addProperty(BODY, message);
+
       lambdaHelper.logger.log("\n Error: \n" + message + "\n");
       lambdaHelper.logger.log("\n Stack Trace: \n" + Throwables.getStackTraceAsString(e) + "\n");
 
@@ -127,77 +173,155 @@ public class GmmServicesLambda implements RequestStreamHandler {
 
   }
 
-  /* Handle the Lambda trigger event and write results */
-  private static void handleGetEvent(JsonObject parameters, LambdaHelper lambdaHelper) throws IOException {
-    JsonObject responseJson = new JsonObject();
+  /* A GMM must be defined else write usage */
+  private static boolean hasGMM(JsonObject parameters, LambdaHelper lambdaHelper) throws IOException {
+
+    if (parameters.has(GMM_KEY)) return true;
 
     Service service = getService(parameters);
+    writeMetadata(lambdaHelper, service);
 
-    if (parameters.has(GMM_KEY)) {
-      ResponseData response = processRequest(parameters, service);
-      responseJson.addProperty(BODY, GSON.toJson(response));
-    } else {
-      Metadata usage = new Metadata(service);
-      responseJson.addProperty(BODY, GSON.toJson(usage));
-    }
-
-    responseJson.addProperty(STATUS_CODE, STATUS_CODE_OK);
-
-    lambdaHelper.writer.write(responseJson.toString());
-    lambdaHelper.writer.close();
-    lambdaHelper.logger.log("\n\n Response: \n" + responseJson.get(BODY).getAsString() + "\n\n");
+    return false;
   }
-  
-  private static void handlePostEvent(JsonObject parameters, LambdaHelper lambdaHelper) throws IOException {
-    JsonObject responseJson = new JsonObject();
+
+  /* Check if HTTP event has query parameters else write usage */
+  private static boolean hasQueryParameters(LambdaHelper lambdaHelper) throws IOException {
+    JsonObject requestJson = lambdaHelper.requestJson;
+   
+    if ((requestJson.has(QUERY_STRING_PARAMETERS) && requestJson.get(QUERY_STRING_PARAMETERS).isJsonNull()) ||
+        !requestJson.has(QUERY_STRING_PARAMETERS)) {
+      writeMetadata(lambdaHelper, Service.SPECTRA);
+      return false;
+    } 
+    
+    return true;
+  }
+ 
+  /* Write the usage */
+  private static void writeMetadata(LambdaHelper lambdaHelper, Service service) throws IOException {
+    String usage = GSON.toJson(new Metadata(service));
+    
+    JsonObject usageJson = new JsonObject();
+    usageJson.addProperty(STATUS_CODE, STATUS_CODE_OK);
+    usageJson.addProperty(BODY, usage);
+    
+    lambdaHelper.writer.write(usageJson.toString());
+    lambdaHelper.writer.close();
+    
+    lambdaHelper.logger.log("\n\n Response: \n" + usageJson.get(BODY).getAsString() + "\n\n");
+  }
+
+  /* Handle the Lambda trigger event */
+  private static Response handleEvent(JsonObject parameters) throws IOException {
     Service service = getService(parameters);
-    
-    if (parameters.has(GMM_KEY) && parameters.has(BODY)) {
-      List<ResponseData> gmmResponses = getPostResponses(parameters, service);
-      ResponseDataPost svcResponse = new ResponseDataPost(gmmResponses, service);
-      responseJson.addProperty(BODY, GSON.toJson(svcResponse));
-    } else {
-      Metadata usage = new Metadata(service);
-      responseJson.addProperty(BODY, GSON.toJson(usage));
-    }
-    
-    responseJson.addProperty(STATUS_CODE, STATUS_CODE_OK);
 
-    lambdaHelper.writer.write(responseJson.toString());
-    lambdaHelper.writer.close();
-    lambdaHelper.logger.log("\n\n Response: \n" + responseJson.get(BODY).getAsString() + "\n\n");
+    ResponseData response = processRequest(parameters, service);
+
+    return Response.builder().service(service).add(response).build();
   }
-  
-  private static List<ResponseData> getPostResponses(JsonObject parameters, Service service) {
+
+  /* Handle the Lambda trigger event for batch processing */
+  private static Response handleBatchEvent(JsonObject parameters) {
+    Service service = getService(parameters);
+
     String body = parameters.get(BODY).getAsString();
     List<String> requestData = Splitter.on("\n").omitEmptyStrings().trimResults().splitToList(body);
 
     List<String> keys = Parsing.splitToList(requestData.subList(0, 1).get(0), Delimiter.COMMA);
     List<String> values = requestData.subList(1, requestData.size());
-    
-    List<ResponseData> gmmResponses = values.parallelStream() 
+
+    Response.Builder response = Response.builder()
+        .service(service);
+
+    values.parallelStream()
         .filter((line) -> !line.startsWith("#") && !line.trim().isEmpty())
-        .map((line) -> {
+        .forEach((line) -> {
           List<String> lineValues = Parsing.splitToList(line, Delimiter.COMMA);
-         
+
           JsonObject requestJson = new JsonObject();
+          
           requestJson.add(GMM_KEY, parameters.get(GMM_KEY));
           
-          int index = 0;
+          if (parameters.has(RMIN_KEY)) {
+            requestJson.add(RMIN_KEY, parameters.get(RMIN_KEY));
+          }
+          
+          if (parameters.has(RMAX_KEY)) {
+            requestJson.add(RMAX_KEY, parameters.get(RMAX_KEY));
+          }
+          
+          if (parameters.has(IMT_KEY)) {
+            requestJson.add(IMT_KEY, parameters.get(IMT_KEY));
+          }
 
-          for (String key : keys) {
+          for (int index = 0; index < keys.size(); index ++) {
+            String key = keys.get(index);
             String value = lineValues.get(index);
             if ("null".equals(value.toLowerCase())) continue;
-           
+
             requestJson.addProperty(key, value);
-            index++;
           }
-         
-          return processRequest(requestJson, service);
-        })
-        .collect(Collectors.toList());
+
+          response.add(processRequest(requestJson, service));
+        });
+
+    return response.build();
+  }
+
+  /* Write the response */
+  private static void writeResponse(Response response, LambdaHelper lambdaHelper) throws IOException {
+    JsonObject responseJson = new JsonObject();
     
-    return gmmResponses;
+    responseJson.addProperty(BODY, GSON.toJson(response));
+    responseJson.addProperty(STATUS_CODE, STATUS_CODE_OK);
+
+    lambdaHelper.writer.write(responseJson.toString());
+    lambdaHelper.writer.close();
+
+    lambdaHelper.logger.log("\n\n Response: \n" + responseJson.get(BODY).getAsString() + "\n\n");
+  }
+
+  /* Construct a JsonObject of the query parameters from the HTTP request */
+  private static JsonObject parseHttpEvent(LambdaHelper lambdaHelper) {
+    JsonObject queryParameters = getHttpParameters(lambdaHelper.requestJson);
+    JsonObject multiValueQueryParameters = getHttpMultiValueParameters(lambdaHelper.requestJson);
+
+    if (multiValueQueryParameters.has(GMM_KEY)) {
+      queryParameters.remove(GMM_KEY);
+      queryParameters.add(GMM_KEY, multiValueQueryParameters.get(GMM_KEY));
+    }
+
+    if (lambdaHelper.requestJson.has(BODY)) {
+      queryParameters.add(BODY, lambdaHelper.requestJson.get(BODY));
+    }
+
+    return queryParameters;
+  }
+  
+  /* Get query parameters from HTTP request: GMM inputs */
+  private static JsonObject getHttpParameters(JsonObject requestJson) {
+    JsonObject params;
+
+    if (requestJson.has(QUERY_STRING_PARAMETERS)) {
+      params = requestJson.get(QUERY_STRING_PARAMETERS).getAsJsonObject();
+    } else {
+      throw new IllegalStateException("No query parameters");
+    }
+
+    return params;
+  }
+
+  /* Get multi-value query parameters from HTTP request: GMMs */
+  private static JsonObject getHttpMultiValueParameters(JsonObject requestJson) {
+    JsonObject params;
+
+    if (requestJson.has(MULTI_QUERY_STRING_PARAMETERS)) {
+      params = requestJson.get(MULTI_QUERY_STRING_PARAMETERS).getAsJsonObject();
+    } else {
+      throw new IllegalStateException("No multi value query parameters");
+    }
+
+    return params;
   }
 
   /* Process the request */
@@ -219,13 +343,23 @@ public class GmmServicesLambda implements RequestStreamHandler {
     return svcResponse;
   }
 
-  /* Get ground motion vs. distance or hanging wall effects results*/
+  /* Get ground motion vs. distance or hanging wall effects results */
   private static ResponseData processRequestDistance(JsonObject parameters, Service service) {
 
+    double rMinDefault = service.equals(Service.DISTANCE) ?
+        GMM_DISTANCE_RMIN_DEFAULT : HW_FW_RMIN_DEFAULT;
+    
+    double rMaxDefault = service.equals(Service.DISTANCE) ?
+        GMM_DISTANCE_RMAX_DEFAULT : HW_FW_RMAX_DEFAULT;
+    
     boolean isLogSpace = service.equals(Service.DISTANCE) ? true : false;
-    Imt imt = Imt.valueOf(parameters.get(IMT_KEY).getAsString());
-    double rMin = parameters.get(RMIN_KEY).getAsDouble();
-    double rMax = parameters.get(RMAX_KEY).getAsDouble();
+
+    Imt imt = parameters.has(IMT_KEY) ? 
+        Imt.valueOf(parameters.get(IMT_KEY).getAsString()) : IMT_DEFAULT;
+    
+    double rMin = parameters.has(RMIN_KEY) ? parameters.get(RMIN_KEY).getAsDouble() : rMinDefault;
+    
+    double rMax = parameters.has(RMAX_KEY) ? parameters.get(RMAX_KEY).getAsDouble() : rMaxDefault;
 
     RequestDataDistance request = new RequestDataDistance(parameters, imt.toString(), rMin, rMax);
 
@@ -255,65 +389,15 @@ public class GmmServicesLambda implements RequestStreamHandler {
     return response;
   }
 
-  /* Construct a JsonObject of the query parameters from the HTTP request */
-  private static JsonObject parseHttpPostEvent(LambdaHelper lambdaHelper) {
-    JsonObject queryParameters = parseHttpGetEvent(lambdaHelper);
-    
-    if (lambdaHelper.requestJson.has(BODY)) {
-      queryParameters.add(BODY, lambdaHelper.requestJson.get(BODY));
-    }
-    
-    return queryParameters;
-  }
-  
-  /* Construct a JsonObject of the query parameters from the HTTP request */
-  private static JsonObject parseHttpGetEvent(LambdaHelper lambdaHelper) {
-    JsonObject queryParameters = getHttpParameters(lambdaHelper.requestJson);
-    JsonObject multiValueQueryParameters = getHttpMultiValueParameters(lambdaHelper.requestJson);
-    
-    if (multiValueQueryParameters.has(GMM_KEY)) {
-      queryParameters.remove(GMM_KEY);
-      queryParameters.add(GMM_KEY, multiValueQueryParameters.get(GMM_KEY));
-    }
-    
-    return queryParameters;
-  }
-  
-  /* Get query parameters from HTTP request: GMM inputs */
-  private static JsonObject getHttpParameters(JsonObject requestJson) {
-    JsonObject params;
-
-    if (requestJson.has(QUERY_STRING_PARAMETERS)) {
-      params = requestJson.get(QUERY_STRING_PARAMETERS).getAsJsonObject();
-    } else {
-      throw new RuntimeException("No query parameters");
-    }
-
-    return params;
-  }
-
-  /* Get multi-value query parameters from HTTP request: GMMs */
-  private static JsonObject getHttpMultiValueParameters(JsonObject requestJson) {
-    JsonObject params;
-
-    if (requestJson.has(MULTI_QUERY_STRING_PARAMETERS)) {
-      params = requestJson.get(MULTI_QUERY_STRING_PARAMETERS).getAsJsonObject();
-    } else {
-      throw new RuntimeException("No multi value query parameters");
-    }
-
-    return params;
-  }
-
   /* Get the type of service to run */
-  private static Service getService(JsonObject requestJson) {
+  private static Service getService(JsonObject parameters) {
     Service service = null;
 
-    if (!requestJson.has(SERVICE)) {
-      throw new RuntimeException("Service not defined");
+    if (!parameters.has(SERVICE)) {
+      throw new IllegalStateException("Service not defined");
     }
 
-    String serviceCheck = requestJson.get(SERVICE).getAsString();
+    String serviceCheck = parameters.get(SERVICE).getAsString();
 
     switch (serviceCheck) {
       case "distance":
@@ -349,18 +433,23 @@ public class GmmServicesLambda implements RequestStreamHandler {
 
     Builder builder = GmmInput.builder().withDefaults();
     for (Entry<String, JsonElement> entry : parameters.entrySet()) {
-      if (entry.getKey().equals(GMM_KEY) || entry.getKey().equals(IMT_KEY) ||
-          entry.getKey().equals(RMAX_KEY) || entry.getKey().equals(RMIN_KEY) ||
-          entry.getKey().equals(SERVICE))
-        continue;
-
+      String key = entry.getKey();
+      
+      if (GMM_KEY.equals(key) ||
+          IMT_KEY.equals(key) ||
+          RMAX_KEY.equals(key) ||
+          RMIN_KEY.equals(key) ||
+          SERVICE.equals(key) ||
+          BODY.equals(key) ||
+          EVENT.equals(key)) continue;
+      
       Field id = Field.fromString(entry.getKey());
       String value = entry.getValue().getAsString();
-      
+
       if (value.equals("")) {
         continue;
       }
-      
+
       builder.set(id, value);
     }
 
@@ -379,6 +468,7 @@ public class GmmServicesLambda implements RequestStreamHandler {
   }
 
   /* Request data for ground motion vs. distance and hanging wall effects */
+  @SuppressWarnings("unused")
   private static class RequestDataDistance extends RequestData {
     String imt;
     double minDistance;
@@ -399,39 +489,57 @@ public class GmmServicesLambda implements RequestStreamHandler {
   }
 
   /* Response data for a HTTP post */
-  private static class ResponseDataPost {
-    String name;
+  @SuppressWarnings("unused")
+  private static class Response {
     String status;
     String date;
-    String url;
-    Object server;
+    Service service;
     List<ResponseData> response;
 
-    ResponseDataPost(List<ResponseData> response, Service service) {
-      name = service.resultName;
+    Response(Builder builder) {
+      service = builder.service;
       status = Status.SUCCESS.toString();
-      this.response = response;
+      response = builder.response.build();
       date = ZonedDateTime.now().format(ServletUtil.DATE_FMT);
-      server = gov.usgs.earthquake.nshmp.www.meta.Metadata.serverData(1, ServletUtil.timer());
+    }
+
+    static Builder builder() {
+      return new Builder();
+    }
+
+    static class Builder {
+      private Service service;
+      ImmutableList.Builder<ResponseData> response;
+
+      private Builder() {
+        response = ImmutableList.builder();
+      }
+
+      Builder service(Service service) {
+        this.service = service;
+        return this;
+      }
+
+      Builder add(ResponseData response) {
+        this.response.add(response);
+        return this;
+      }
+
+      Response build() {
+        return new Response(this);
+      }
     }
   }
 
   /* Response data for result */
   @SuppressWarnings("unused")
   private static class ResponseData {
-    String name;
-    String status;
-    String date; 
-    String url;
     Object server;
     RequestData request;
     XY_DataGroup means;
     XY_DataGroup sigmas;
 
     ResponseData(Service service, RequestData request) {
-      name = service.resultName;
-      status = Status.SUCCESS.toString(); 
-      date = ZonedDateTime.now().format(ServletUtil.DATE_FMT); 
       server = gov.usgs.earthquake.nshmp.www.meta.Metadata.serverData(1, ServletUtil.timer());
 
       this.request = request;
@@ -472,11 +580,11 @@ public class GmmServicesLambda implements RequestStreamHandler {
 
     String status = Status.USAGE.toString();
     String description;
-    String syntax;
+//    String syntax;
     Parameters parameters;
 
     Metadata(Service service) {
-      this.syntax = "%s://%s/nshmp-haz-ws/gmm" + service.pathInfo + "?";
+//      this.syntax = "%s://%s/nshmp-haz-ws/gmm" + service.pathInfo + "?";
       this.description = service.description;
       this.parameters = new Parameters(service);
     }
@@ -687,7 +795,6 @@ public class GmmServicesLambda implements RequestStreamHandler {
     DISTANCE(
         "Ground Motion Vs. Distance",
         "Compute ground motion Vs. distance",
-        "/distance",
         "Means",
         "Sigmas",
         "Distance (km)",
@@ -697,7 +804,6 @@ public class GmmServicesLambda implements RequestStreamHandler {
     HW_FW(
         "Hanging Wall Effect",
         "Compute hanging wall effect on ground motion Vs. distance",
-        "/hw-fw",
         "Means",
         "Sigmas",
         "Distance (km)",
@@ -707,7 +813,6 @@ public class GmmServicesLambda implements RequestStreamHandler {
     SPECTRA(
         "Deterministic Response Spectra",
         "Compute deterministic response spectra",
-        "/spectra",
         "Means",
         "Sigmas",
         "Period (s)",
@@ -716,8 +821,7 @@ public class GmmServicesLambda implements RequestStreamHandler {
 
     final String name;
     final String description;
-    final String pathInfo;
-    final String resultName;
+    final String value;
     final String groupNameMean;
     final String groupNameSigma;
     final String xLabel;
@@ -725,14 +829,17 @@ public class GmmServicesLambda implements RequestStreamHandler {
     final String yLabelSigma;
 
     private Service(
-        String name, String description,
-        String pathInfo, String groupNameMean,
-        String groupNameSigma, String xLabel,
-        String yLabelMedian, String yLabelSigma) {
+        String name,
+        String description,
+        String groupNameMean,
+        String groupNameSigma,
+        String xLabel,
+        String yLabelMedian,
+        String yLabelSigma) {
+
       this.name = name;
       this.description = description;
-      this.resultName = name + " Results";
-      this.pathInfo = pathInfo;
+      value = name().toLowerCase();
       this.groupNameMean = groupNameMean;
       this.groupNameSigma = groupNameSigma;
       this.xLabel = xLabel;
@@ -740,6 +847,21 @@ public class GmmServicesLambda implements RequestStreamHandler {
       this.yLabelSigma = yLabelSigma;
     }
 
+  }
+  
+  private static final class ServiceSerializer implements JsonSerializer<Service> {
+
+    @Override
+    public JsonElement serialize(Service service, Type typeOfSrc, JsonSerializationContext context) {
+      JsonObject json = new JsonObject();
+      
+      json.addProperty("name", service.name);
+      json.addProperty("decription", service.description);
+      json.addProperty("value", service.value);
+      
+      return json;
+    }
+    
   }
 
 }

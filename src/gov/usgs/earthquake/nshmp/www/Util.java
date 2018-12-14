@@ -154,6 +154,9 @@ public class Util {
    */
   static class RequestKey {
     static final String BODY = "body";
+    static final String EVENT = "event";
+    static final String INVOKE = "invoke";
+    static final String INVOKE_BATCH = "invoke-batch";
     static final String QUERY_STRING_PARAMETERS = "queryStringParameters";
     static final String SERVICE = "service";
     static final String MULTI_QUERY_STRING_PARAMETERS = "multiValueQueryStringParameters";
